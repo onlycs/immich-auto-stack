@@ -1,2 +1,4 @@
-requests
-str2bool==1.1
+httpx<0.29.0
+attrs
+python-dateutil
+asyncio

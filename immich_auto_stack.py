@@ -1,251 +1,223 @@
 #!/usr/bin/env python3
 
-import logging, sys
-from itertools import groupby
-import json
+import asyncio
+import logging
+import sys
 import os
-import re
-import time
+from uuid import UUID
+from typing import Callable, Optional, TypeVar, Any
 
-from str2bool import str2bool
-from requests import Session
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from urllib.parse import urlparse
+from immich_client.api.search import search_assets
+from immich_client.api.stacks import search_stacks, create_stack
+from immich_client.client import AuthenticatedClient
+from immich_client.models.asset_response_dto import AssetResponseDto
+from immich_client.models.metadata_search_dto import MetadataSearchDto
+from immich_client.models.stack_create_dto import StackCreateDto
 
 logging.basicConfig(
-  stream=sys.stdout, 
-  level=logging.INFO, 
-  format='%(asctime)s - %(levelname)s - %(message)s'
+    stream=sys.stdout,
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-criteria_default = [
-  {
-    "key": "originalFileName",
-    "split": {
-      "key": ".",
-      "index": 0
-    }
-  },
-  {
-    "key": "localDateTime"
-  }
-]
+# holy shit i just replaced an entire dependency in one line
+str2bool: Callable[[str], bool] = lambda v: v.strip().lower() in ("1", "true", "yes")
 
-def get_criteria_config():
-    criteria_override = os.environ.get("CRITERIA")
-    if criteria_override:
-        return json.loads(criteria_override)
-    return criteria_default
+conversions: dict[type, Callable[[str], Any]] = {
+        bool: str2bool,
+        str: lambda x: x
+}
 
-def apply_criteria(x: dict) -> list:
-    """
-    Given a photo dataset, pick out the identified keys as defined by CRITERIA.
+seen: dict[str, int] = {}
 
-    Keys can be raw values or a subset of values (using split or regex modifiers).
+T = TypeVar("T")
+def environment(key: str, typ: type[T], default: Optional[T] = None, cast: Optional[Callable[[str], T]] = None):
+    if key in os.environ:
+        if cast is None:
+            if typ in conversions: cast = conversions[typ]
+            else: raise Exception(f"Could not convert {key} from string")
+        return cast(os.environ[key])
+    elif default is not None: return default
+    else: raise Exception(f"Environment variable {key} not set")
 
-    If any of the key values is abnormal (None, absent, regex mismatch), return
-    an empty list.
-    """
-    criteria_list = []
-    for item in get_criteria_config():
-        value = x.get(item["key"])
-        if value is None:
-            # None is a undesireable key value for this project because we rely on keys
-            # to categorize similar photos, and typically None represents the absence
-            # of information.
-            #
-            # A real scenario example: suppose some photos have not yet generated
-            # thumbnails. It would be undesireable to create a stack of all the photos
-            # whose thumbhash is None.
-            return []
-        if "split" in item.keys():
-            split_key = item["split"]["key"]
-            split_index = item["split"]["index"]
-            value = value.split(split_key)[split_index]
-        if "regex" in item.keys():
-            regex_key = item["regex"]["key"]
-            # expects at least one regex group to be defined
-            regex_index = item["regex"].get("index", 1)
-            match = re.match(regex_key, value)
-            if match:
-              value = match.group(regex_index)
-            elif not str2bool(os.environ.get("SKIP_MATCH_MISS")):
-              raise Exception(f"Match not found for value: {value}, regex: {regex_key}")
-            else:
-              return []
-        criteria_list.append(value)
-    return criteria_list
+class AsyncImmich:
+    def __init__(self, url: str, key: str):
+        self.client = AuthenticatedClient(url, key)
+        # Cache for stack lookups to avoid redundant API calls
+        self._stack_cache: dict[str, set[str]] = {}
 
-def parent_criteria(x):
-  parent_ext = ['.jpg', '.jpeg', '.png']
+    async def fetchAssets(self, size: int = 1000) -> list[AssetResponseDto]:
+        page: int = 1
+        assets: list[AssetResponseDto] = []
 
-  parent_promote = list(filter(None, os.environ.get("PARENT_PROMOTE", "").split(",")))
-  parent_promote_baseline = 0
+        logger.info('⬇️    Fetching assets: ')
+        logger.info(f'     Page size: {size}')
 
-  lower_filename = x["originalFileName"].lower()
+        while True:
+            response = await search_assets.asyncio(
+                client=self.client,
+                body=MetadataSearchDto(size=size, page=page, with_stacked=True)
+            )
 
-  if any(lower_filename.endswith(ext) for ext in parent_ext):
-    parent_promote_baseline -= 100
+            if response is None:
+                logger.error('     Error fetching assets')
+                break
 
-  for key in parent_promote:
-    if key.lower() in lower_filename:
-      logger.info("promoting " + x["originalFileName"] + f" for key {key}")
-      parent_promote_baseline -= 1
+            assets.extend(response.assets.items)
 
-  return [parent_promote_baseline, x["originalFileName"]]
+            if response.assets.next_page is None:
+                break
 
+            page = int(response.assets.next_page)
 
-class Immich():
-  def __init__(self, url: str, key: str):
-    self.api_url = f'{urlparse(url).scheme}://{urlparse(url).netloc}/api'
-    self.headers = {
-      'x-api-key': key,
-      'Accept': 'application/json'
-    }
-    self.assets = list()
-  
-  def fetchAssets(self, size: int = 1000) -> list:
-    payload = {
-      'size' : size,
-      'page' : 1,
-      #'withExif': True,
-      'withStacked': True
-    }
-    assets_total = list()
+        self.assets = assets
 
-    logger.info(f'⬇️  Fetching assets: ')
-    logger.info(f'   Page size: {size}')
+        logger.info(f'     Pages: {page}')
+        logger.info(f'     Assets: {len(self.assets)}')
 
-    session = Session()
-    retry = Retry(connect=3, backoff_factor=0.5)
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
+        return self.assets
 
-    while payload["page"] != None:
-      response = session.post(f"{self.api_url}/search/metadata", headers=self.headers, json=payload)
+    async def makeStack(self, ids: list[UUID]) -> bool:
+        response = await create_stack.asyncio_detailed(
+            client=self.client,
+            body=StackCreateDto(asset_ids=ids)
+        )
 
-      if not response.ok:
-        logger.error('   Error:', response.status_code, response.text)
+        if response.status_code.is_success:
+            logger.info("    🟢 Success!")
+            return True
+        else:
+            logger.error(f"    🔴 Error! {response.status_code} {response.content.decode('utf-8')}")
+            return False
 
-      response_data = response.json()
-      assets_total = assets_total + response_data['assets']['items']
-      payload["page"] = response_data['assets']['nextPage']
-    
-    self.assets = assets_total
-    
-    logger.info(f'   Pages: {payload["page"]}')   
-    logger.info(f'   Assets: {len(self.assets)}')
-    
-    return self.assets
+    async def isStacked(self, q_primary: AssetResponseDto, asset: AssetResponseDto) -> bool:
+        primary_id = q_primary.id
 
-  def modifyAssets(self, payload: dict) -> None:
-    session = Session()
-    retry = Retry(connect=3, backoff_factor=0.5)
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
+        # Check cache first
+        if primary_id in self._stack_cache:
+            return asset.id in self._stack_cache[primary_id]
 
-    response = session.put(f"{self.api_url}/assets", headers=self.headers, json=payload)
+        # Fetch and cache stack info
+        res = await search_stacks.asyncio(client=self.client, primary_asset_id=UUID(primary_id))
 
-    if response.ok:
-      logger.info("  🟢 Success!")
-    else:
-      logger.error(f"  🔴 Error! {response.status_code} {response.text}") 
+        if res is None:
+            self._stack_cache[primary_id] = set()
+            return False
 
+        # Cache all asset IDs in stacks for this primary
+        stacked_ids = {a.id for stk in res for a in stk.assets}
+        self._stack_cache[primary_id] = stacked_ids
 
-def stackBy(data: list, criteria) -> list:
-  # Optional: remove incompatible file names
-  if str2bool(os.environ.get("SKIP_MATCH_MISS")):
-    data = filter(criteria, data)
+        return asset.id in stacked_ids
 
-  # Sort by primary and secondary criteria
-  data = sorted(data, key=criteria)
+    async def batchIsStacked(self, checks: list[tuple[AssetResponseDto, AssetResponseDto]]) -> list[bool]:
+        """Batch check if assets are stacked, with concurrency control"""
+        semaphore = asyncio.Semaphore(10)  # Limit concurrent API calls
 
-  # Group by primary and secondary criteria
-  groups = groupby(data, key=criteria)
-  
-  # Extract and process groups into a list of tuples
-  groups = [(key, list(group)) for key, group in groups]
-  
-  # Filter only groups that have more than one item
-  groups = [x for x in groups if len(x[1]) > 1 ] 
+        async def check_with_semaphore(primary, asset):
+            async with semaphore:
+                return await self.isStacked(primary, asset)
 
-  # Raise error if any groups have an empty key
-  if any((group[0] == [] or None in group[0]) for group in groups):
-      raise Exception(
-          "Some photos do not match the criteria you provided. Consider refining your"
-          "criteria. If the criteria was not intended to match all files, use the"
-          "SKIP_MATCH_MISS environment variable to skip processing of those photos."
-      )
+        tasks = [check_with_semaphore(primary, asset) for primary, asset in checks]
+        return await asyncio.gather(*tasks)
 
-  return groups
+def stackAssets(data: list[AssetResponseDto]) -> dict[str, list[AssetResponseDto]]:
+    filenames = [(asset.original_file_name, asset) for asset in data]
+    stacks = {}
 
-def stratifyStack(stack: list) -> list:
-  # Ensure the desired parent is first in the list
-  return sorted(stack, key=parent_criteria)
+    for (filename, asset) in filenames:
+        key = filename.split('.')[0]
+        if key not in stacks:
+            stacks[key] = [asset]
+        else:
+            stacks[key].append(asset)
 
+    return stacks
 
-def main():
+def stratifyStack(stack: list[AssetResponseDto]) -> list[AssetResponseDto]:
+    stack.sort(key=lambda asset: asset.original_file_name.split(".")[-1].lower() in ["jpg", "jpeg"])
+    stack.reverse()
+    return stack
 
-  api_key = os.environ.get("API_KEY", False)
-
-  api_url = os.environ.get("API_URL", "http://immich_server:3001/api")
-
-  skip_previous = str2bool(os.environ.get("SKIP_PREVIOUS", True))
-
-  dry_run = str2bool(os.environ.get("DRY_RUN", False))
-
-  if not api_key:
-    logger.warn("API key is required")
-    return
-
-  logger.info('============== INITIALIZING ==============')
-
-  if dry_run:
-    logger.info('🔒  Dry run enabled, no changes will be applied')
-  
-  immich = Immich(api_url, api_key)
-  
-  assets = immich.fetchAssets()
-
-  stacks = stackBy(assets, apply_criteria)
-
-  for i, v in enumerate(stacks):
-    key, stack = v
-
+async def processStack(immich: AsyncImmich, key: str, stack: list[AssetResponseDto],
+                      stack_index: int, total_stacks: int, dry_run: bool) -> bool:
+    """Process a single stack asynchronously"""
     stack = stratifyStack(stack)
 
-    parent_id = stack[0]['id']
-    children_id = []
-    
-    if skip_previous:
-      children_id = [x['id'] for x in stack[1:] if x['stackCount'] == None ]
-      
-      if len(children_id) == 0:
-        logger.info(f'{i}/{len(stacks)} Key: {key} SKIP! No new children!')
-        continue
-      
+    if stack[0].id not in seen or seen[stack[0].id] != len(stack[1:]):
+        seen[stack[0].id] = len(stack[1:])
     else:
-      children_id = [x['id'] for x in stack[1:]]
+        logger.info(f'{stack_index}/{total_stacks} Key: {key} SKIP! Seen before!')
+        return False
 
-    logger.info(f'{i}/{len(stacks)} Key: {key}')
-    logger.info(f'   Parent name: {stack[0]["originalFileName"]} ID: {parent_id}')
-    
+    # Batch check if children are already stacked
+    checks = [(stack[0], child) for child in stack[1:]]
+    if checks:
+        stacked_results = await immich.batchIsStacked(checks)
+        unstacked_children = [child for child, is_stacked in zip(stack[1:], stacked_results) if not is_stacked]
+    else:
+        unstacked_children = []
+
+    if len(unstacked_children) == 0:
+        logger.info(f'{stack_index}/{total_stacks} Key: {key} SKIP! No new children!')
+        return False
+
+    logger.info(f'{stack_index}/{total_stacks} Key: {key}')
+    logger.info(f'     Parent name: {stack[0].original_file_name} ID: {stack[0].id}')
+
     for child in stack[1:]:
-      logger.info(f'   Child name:  {child["originalFileName"]} ID: {child["id"]}')
+        logger.info(f'     Child name:    {child.original_file_name} ID: {child.id}')
 
-    if len(children_id) > 0:
-      payload = {
-        "ids": children_id,
-        "stackParentId": parent_id
-      }
+    if not dry_run:
+        success = await immich.makeStack([UUID(asset.id) for asset in stack])
+        return success
 
-      if not dry_run:
-        time.sleep(.1)
-        immich.modifyAssets(payload)
+    return True
+
+async def processStacksConcurrently(immich: AsyncImmich, stacks: dict[str, list[AssetResponseDto]], dry_run: bool):
+    """Process stacks with controlled concurrency"""
+    semaphore = asyncio.Semaphore(5)  # Limit concurrent stack processing
+
+    async def process_with_semaphore(args):
+        key, stack, index = args
+        async with semaphore:
+            return await processStack(immich, key, stack, index, len(stacks), dry_run)
+
+    # Create tasks for all stacks
+    stack_items = [(key, stack, i) for i, (key, stack) in enumerate(stacks.items())]
+    tasks = [process_with_semaphore(args) for args in stack_items]
+
+    # Process all stacks concurrently
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Log any exceptions
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            key = stack_items[i][0]
+            logger.error(f"Error processing stack {key}: {result}")
+
+async def main():
+    api_key = environment("API_KEY", str)
+    api_url = environment("API_URL", str, "http://immich_server:3001/api")
+    dry_run = environment("DRY_RUN", bool, False)
+
+    if not api_key:
+        logger.warning("API key is required")
+        return
+
+    logger.info('============== INITIALIZING ==============')
+
+    if dry_run:
+        logger.info('🔒    Dry run enabled, no changes will be applied')
+
+    immich = AsyncImmich(api_url, api_key)
+    assets = await immich.fetchAssets()
+
+    stacks = stackAssets(assets)
+
+    # Process stacks concurrently
+    await processStacksConcurrently(immich, stacks, dry_run)
 
 if __name__ == '__main__':
-  main()
+    asyncio.run(main())
